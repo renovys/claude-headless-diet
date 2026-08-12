@@ -4,6 +4,8 @@ Field notes on cutting token usage in **headless** Claude Code runs (`claude -p`
 
 Most of what follows contradicts a plausible-sounding assumption. In our automations the two largest wins were not prompt rewriting: they were **where the CLI reads its instruction files from** and **which flag actually controls the tool schema**. Everything here is written as *belief → what we measured → what to do*, and every number is one we recorded ourselves.
 
+> **Current CLI note (August 2026).** The measurements below were taken before Claude Code added its current `--bare` scripted mode and before the documented availability semantics of bare-name `--disallowedTools`. Current official docs say `--bare` skips CLAUDE.md, hooks, skills, plugins, MCP discovery and auto memory, while a bare tool name such as `--disallowedTools Bash` removes that tool from model context. `--bare` does not read subscription/OAuth credentials, so it requires API-key-style authentication; the isolated-`HOME` approach below remains relevant when subscription authentication is a requirement. The measured tables are kept as historical observations, not claims about every current CLI build.
+
 ## How we measured
 
 - Claude Code CLI, headless invocations (`claude -p`), models Opus and Sonnet depending on the pipeline.
@@ -28,9 +30,9 @@ One measurement discipline is worth stating up front, because it is what saved u
 | `--tools` with 3 tools | 31.3K |
 | `--tools none` | 28.0K |
 
-`--allowedTools` gates *permission*. The tool schemas are loaded regardless. Only `--tools` changes what is sent.
+In those runs, `--allowedTools` gated *permission* while `--tools` changed what was sent. Current Claude Code docs still describe `--allowedTools` as a permission control and `--tools` as an availability control. They now also document a second availability mechanism: a **bare tool name** in `--disallowedTools` removes that tool from context, while a scoped rule such as `Bash(rm *)` leaves the Bash schema visible and only blocks matching calls.
 
-**Do this.** Decide the minimum tool set your automation actually needs and pass it to **`--tools`**. If you also want the permission gate, pass the same set to `--allowedTools` as well — they are complementary, not alternatives. For pipelines that only need the model to think and return text, `--tools none` is the floor.
+**Do this.** For an allowlist, `--tools` remains the clearest way to specify the minimum built-in tool set. If you also want an approval gate, use `--allowedTools`. For a denylist, current builds can remove whole tools with bare-name `--disallowedTools`. For pipelines that only need the model to think and return text, `--tools none` is still the explicit floor.
 
 ## 2. `--tools` is variadic, so a trailing prompt gets eaten
 
@@ -49,11 +51,11 @@ printf '%s' "$PROMPT" | claude -p --tools Read,Glob --output-format json
 claude -p --tools Read,Glob "$PROMPT"
 ```
 
-## 3. Project instruction files load from `$HOME`, and no flag stops them
+## 3. Project instruction files loaded from `$HOME` in the measured non-bare runs
 
-**The belief.** A run started in a clean working directory, or started with the "exclude instructions" flag, will not load your `CLAUDE.md` chain.
+**The belief.** A run started in a clean working directory, or started with the instruction-exclusion mechanism available in our July 2026 setup, would not load the `CLAUDE.md` chain.
 
-**What we measured.** Neither works. Our instruction chain (about 38KB across two included files) was loaded into the system prompt on **every** headless call.
+**What we measured.** Neither approach we tested worked. Our instruction chain (about 38KB across two included files) was loaded into the system prompt on **every** tested non-bare headless call.
 
 | Arm | Total tokens for one run |
 |---|---|
@@ -62,31 +64,32 @@ claude -p --tools Read,Glob "$PROMPT"
 | changing `cwd` only | no change |
 | isolated `HOME` | 8,849 |
 
-That is a **77% reduction** on that pipeline, and it is the single biggest lever we found. The instruction chain resolves relative to `HOME`, not to the working directory, so only replacing `HOME` removes it.
+That was a **77% reduction** on that pipeline, and it was the single biggest lever in our setup. The loaded instruction chain followed the home configuration rather than the working directory, so replacing `HOME` removed it in those runs.
 
-**Do this.** Give each headless pipeline its own throwaway home directory and run with `env HOME=<apphome>` and `cwd=<apphome>`. Two caveats we hit:
+**Current alternative.** Claude Code now documents `--bare` as the recommended mode for scripted calls. It skips automatic discovery of CLAUDE.md, hooks, skills, plugins, MCP servers and auto memory. But bare mode also skips OAuth/keychain reads and does not read `CLAUDE_CODE_OAUTH_TOKEN`; authentication must come from `ANTHROPIC_API_KEY` or an `apiKeyHelper`. If API-key billing is acceptable, test `--bare` before building an isolated-home wrapper. If subscription/OAuth authentication is a hard requirement, `--bare` is not a drop-in replacement for the method below.
+
+**Subscription/OAuth path we used.** Give each headless pipeline its own throwaway home directory and run with `env HOME=<apphome>` and `cwd=<apphome>`. Two caveats we hit:
 
 - **Keep your existing auth.** Symlink only the credentials file from the real home into the isolated one. Do not let the isolated home fall back to an API key — that silently switches the run from your subscription to metered billing. We made the launcher **abort** if the credential symlink is missing, rather than proceed.
 - **Strip billing-override environment variables** (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and the Bedrock/Vertex switches) from the child environment for the same reason: if present, they take precedence over the subscription.
-- There is also a documented "skip instruction files" flag that bypasses the chain but does not read the OAuth credentials, so it forces API-key billing. We could not use it.
 
 ### The limit: isolated `HOME` breaks file-editing tools
 
-Read-only work survives isolation. **Writing does not.** In our runs `Read`, `Glob`, read-only `Bash` and the web tools all worked from an isolated home, but `Edit` failed there while succeeding from the real home with identical flags. We tried a minimal `settings.json` granting `Edit`, an accept-edits permission mode, and pre-accepting the directory trust flag — none of the three fixed it. The cause is state attached to the home directory, and we did not isolate it further.
+Read-only work survived isolation in our July 2026 tests. **Writing did not.** `Read`, `Glob`, read-only `Bash` and the web tools all worked from an isolated home, but `Edit` failed there while succeeding from the real home with identical flags. We tried a minimal `settings.json` granting `Edit`, an accept-edits permission mode, and pre-accepting the directory trust flag — none of the three fixed it. The cause appeared to be state attached to the home directory; we did not isolate it further.
 
-Practical consequences:
+Practical consequences for the isolated-home method:
 
-- If a pipeline **reads** files outside the isolated home, add `--add-dir <path>`. We confirmed this restores read access *and* does not pull the instruction chain back in (the run stayed at 8,960 tokens).
-- If a pipeline **writes** files, do not isolate it. We reverted one such pipeline after seeing edits fail silently, and we accept the cost: about 18,500 extra tokens per run on that one job.
-- The structural fix, if you care enough: have the model decide and a plain script perform the write.
+- If a pipeline **reads** files outside the isolated home, add `--add-dir <path>`. We confirmed this restored read access *and* did not pull the instruction chain back in (the run stayed at 8,960 tokens).
+- If a pipeline **writes** files, do not assume the isolated-home method works. Exercise `Edit`/write tools on your current CLI before adopting it. We reverted one such pipeline after seeing edits fail silently.
+- The structural fix, if needed, is to have the model decide and a plain script perform the write.
 
-**Checklist before isolating a pipeline:** ① does it write files? → don't isolate ② read-only? → isolate plus `--add-dir` ③ after the change, exercise the tools for real. Passing a syntax check proves nothing here, because the failure mode is a tool that quietly stops working.
+**Checklist before isolating a pipeline:** ① does it write files? → test real writes first ② read-only? → isolate plus `--add-dir` ③ after the change, exercise the tools for real. Passing a syntax check proves nothing here, because the failure mode was a tool that quietly stopped working.
 
-## 4. Headless runs cannot see your environment variables
+## 4. Headless runs cannot see your environment variables unless they inspect them
 
 **The belief.** Exporting `MODE=1` before the call is enough for the model to branch on it.
 
-**What we measured** (2026-07-21). Only the prompt text enters the context. Given "if `X` is 1 use mode A, otherwise mode B" with `X=1` actually exported, the run's **first output was mode B — wrong** — and it only corrected itself after choosing, on its own initiative, to shell out and check. With the same instruction but the value **injected as text at the top of the prompt** (and the environment variable deliberately set to the opposite value), it answered correctly and deterministically.
+**What we measured** (2026-07-21). Only the prompt text entered the model context automatically. Given "if `X` is 1 use mode A, otherwise mode B" with `X=1` actually exported, the run's **first output was mode B — wrong** — and it only corrected itself after choosing, on its own initiative, to shell out and check. With the same instruction but the value **injected as text at the top of the prompt** (and the environment variable deliberately set to the opposite value), it answered correctly and deterministically.
 
 **Do this.** Have the launcher decide the mode and prepend it to the prompt as a short header, and word the prompt to match ("the injected flag", not "the environment variable"):
 
@@ -159,19 +162,18 @@ One rewriting proxy we evaluated reported "90.8% saved". Recomputing from its ow
 
 ## Quick checklist
 
-- [ ] Pass `--tools` (not only `--allowedTools`) with the minimum set; `--tools none` if no tools are needed.
+- [ ] Current API-key automation: test `--bare` first; it skips auto-loaded project/user context.
+- [ ] Subscription/OAuth automation: `--bare` is not a drop-in replacement; use an authenticated non-bare setup and measure it.
+- [ ] Pass `--tools` with the minimum allowlist; `--tools none` if no built-ins are needed. Bare-name `--disallowedTools` can remove specific whole tools on current builds.
 - [ ] Prompt goes right after `-p` or on stdin, never trailing a variadic flag.
-- [ ] Read-only pipelines: isolated `HOME` + symlinked credentials + `--add-dir`; abort if credentials are missing.
-- [ ] Writing pipelines: do not isolate `HOME`; budget the extra cost or move the write out of the model.
-- [ ] Strip API-key / alternate-endpoint environment variables from the child environment.
-- [ ] Inject run mode as prompt text; never rely on environment variables.
-- [ ] Pin the return format of anything you delegate.
-- [ ] Cap every long-output command.
-- [ ] Measure with `--output-format json` before and after. Twice, spaced beyond the cache TTL.
+- [ ] If using isolated `HOME`, preserve the intended credentials, strip billing overrides, add `--add-dir` for external reads and exercise writes for real.
+- [ ] Inject run mode as prompt text; never assume environment variables are automatically model context.
+- [ ] Pin delegated return formats and cap long command output.
+- [ ] Measure with `--output-format json` before and after, with A/B runs spaced beyond the relevant cache TTL.
 
 ## Disclaimer
 
-These are unofficial observations from one setup, not documented behaviour. Flag semantics, defaults and prompt composition change between CLI versions, and several of the effects above are exactly the kind that a release can silently fix or reverse. Re-measure on your own version before relying on any of it.
+These are unofficial observations from one setup, mostly measured in July 2026. Claude Code flag semantics, defaults, authentication and prompt composition change over time. Current official documentation should take precedence for present-day flag semantics; re-measure token effects on your own version before relying on the historical numbers here.
 
 ## License
 
