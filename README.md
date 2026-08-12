@@ -32,7 +32,7 @@ One measurement discipline is worth stating up front, because it is what saved u
 
 In those runs, `--allowedTools` gated *permission* while `--tools` changed what was sent. Current Claude Code docs still describe `--allowedTools` as a permission control and `--tools` as an availability control. They now also document a second availability mechanism: a **bare tool name** in `--disallowedTools` removes that tool from context, while a scoped rule such as `Bash(rm *)` leaves the Bash schema visible and only blocks matching calls.
 
-**Do this.** For an allowlist, `--tools` remains the clearest way to specify the minimum built-in tool set. If you also want an approval gate, use `--allowedTools`. For a denylist, current builds can remove whole tools with bare-name `--disallowedTools`. For pipelines that only need the model to think and return text, `--tools none` is still the explicit floor.
+**Do this.** For an allowlist, `--tools` remains the clearest way to specify the minimum built-in tool set. If you also want an approval gate, use `--allowedTools`. For a denylist, current docs state that a bare tool name in `--disallowedTools` removes that tool from Claude's context, while a scoped rule such as `Bash(rm *)` leaves the tool available and denies only matching calls. For pipelines that only need the model to think and return text, the empty set is the floor — the runs above passed `--tools none`, but current docs spell the empty set as `--tools ""`, so check your build before copying the older form.
 
 ## 2. `--tools` is variadic, so a trailing prompt gets eaten
 
@@ -66,7 +66,7 @@ claude -p --tools Read,Glob "$PROMPT"
 
 That was a **77% reduction** on that pipeline, and it was the single biggest lever in our setup. The loaded instruction chain followed the home configuration rather than the working directory, so replacing `HOME` removed it in those runs.
 
-**Current alternative.** Claude Code now documents `--bare` as the recommended mode for scripted calls. It skips automatic discovery of CLAUDE.md, hooks, skills, plugins, MCP servers and auto memory. But bare mode also skips OAuth/keychain reads and does not read `CLAUDE_CODE_OAUTH_TOKEN`; authentication must come from `ANTHROPIC_API_KEY` or an `apiKeyHelper`. If API-key billing is acceptable, test `--bare` before building an isolated-home wrapper. If subscription/OAuth authentication is a hard requirement, `--bare` is not a drop-in replacement for the method below.
+**Current alternative.** Claude Code now documents `--bare` as the recommended mode for scripted calls. It skips automatic discovery of CLAUDE.md, hooks, skills, plugins, MCP servers and auto memory. But bare mode never reads OAuth or the keychain; the CLI states that authentication is strictly `ANTHROPIC_API_KEY` or an `apiKeyHelper` supplied via `--settings` (third-party Bedrock/Vertex/Foundry providers use their own credentials). If API-key billing is acceptable, test `--bare` before building an isolated-home wrapper. If subscription/OAuth authentication is a hard requirement, `--bare` is not a drop-in replacement for the method below.
 
 **Subscription/OAuth path we used.** Give each headless pipeline its own throwaway home directory and run with `env HOME=<apphome>` and `cwd=<apphome>`. Two caveats we hit:
 
@@ -80,7 +80,7 @@ Read-only work survived isolation in our July 2026 tests. **Writing did not.** `
 Practical consequences for the isolated-home method:
 
 - If a pipeline **reads** files outside the isolated home, add `--add-dir <path>`. We confirmed this restored read access *and* did not pull the instruction chain back in (the run stayed at 8,960 tokens).
-- If a pipeline **writes** files, do not assume the isolated-home method works. Exercise `Edit`/write tools on your current CLI before adopting it. We reverted one such pipeline after seeing edits fail silently.
+- If a pipeline **writes** files, do not assume the isolated-home method works. Exercise `Edit`/write tools on your current CLI before adopting it. We reverted one such pipeline after seeing edits fail silently, at a measured cost of about 18,500 extra tokens per run on that job.
 - The structural fix, if needed, is to have the model decide and a plain script perform the write.
 
 **Checklist before isolating a pipeline:** ① does it write files? → test real writes first ② read-only? → isolate plus `--add-dir` ③ after the change, exercise the tools for real. Passing a syntax check proves nothing here, because the failure mode was a tool that quietly stopped working.
@@ -164,7 +164,7 @@ One rewriting proxy we evaluated reported "90.8% saved". Recomputing from its ow
 
 - [ ] Current API-key automation: test `--bare` first; it skips auto-loaded project/user context.
 - [ ] Subscription/OAuth automation: `--bare` is not a drop-in replacement; use an authenticated non-bare setup and measure it.
-- [ ] Pass `--tools` with the minimum allowlist; `--tools none` if no built-ins are needed. Bare-name `--disallowedTools` can remove specific whole tools on current builds.
+- [ ] Pass `--tools` with the minimum allowlist; the empty set if no built-ins are needed (`""` per current docs; our July runs used `none`). Bare-name `--disallowedTools` removes specific whole tools from context.
 - [ ] Prompt goes right after `-p` or on stdin, never trailing a variadic flag.
 - [ ] If using isolated `HOME`, preserve the intended credentials, strip billing overrides, add `--add-dir` for external reads and exercise writes for real.
 - [ ] Inject run mode as prompt text; never assume environment variables are automatically model context.
